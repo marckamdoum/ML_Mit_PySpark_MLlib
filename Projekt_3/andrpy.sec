@@ -1,0 +1,219 @@
+import os
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline, PipelineModel
+from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler
+from pyspark.ml.classification import LogisticRegression, DecisionTreeClassifier, RandomForestClassifier
+from pyspark.ml.evaluation import MulticlassClassificationEvaluator, BinaryClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+import shutil
+
+# === у меня без явного указания в PyCharm не работает именно система предсказаний, тренировка работает
+#os.environ["JAVA_HOME"] = r"C:\Program Files\Zulu\zulu-11"
+#os.environ["PATH"] = r"C:\Program Files\Zulu\zulu-11\bin;" + os.environ["PATH"]
+#os.environ["PYSPARK_PYTHON"] = r"C:\Users\Administrator\anaconda3\envs\spark_2025\python.exe"
+#os.environ["PYSPARK_DRIVER_PYTHON"] = r"C:\Users\Administrator\anaconda3\envs\spark_2025\python.exe"
+
+
+MODEL_DIR = "best_model"
+
+# ==================== Spark ====================
+def create_spark_session(app_name="MLlib Kundenmodell"):
+    # Erstellen einer Spark-Sitzung mit benutzerdefinierten Konfigurationen
+    spark = SparkSession.builder \
+        .appName(app_name) \
+        .config("spark.driver.memory", "2g") \
+        .config("spark.executor.memory", "2g") \
+        .config("spark.ui.port", "4050") \
+        .config("spark.port.maxRetries", "100") \
+        .config("spark.executor.heartbeatInterval", "60s") \
+        .config("spark.network.timeout", "120s") \
+        .config("spark.python.worker.memory", "2g") \
+        .getOrCreate()
+    return spark
+
+# ==================== Datenvorbereitung ====================
+def vorbereite_daten():
+    # Laden der Kundendaten und Hinzufügen einer ID-Spalte
+    df_kunden = pd.read_csv("kunden.csv")
+    df_kunden.insert(0, "id", range(1, len(df_kunden) + 1))
+    df_kunden.to_csv("temp_kunden.csv", index=False)
+
+    # Erzeugen von zufälligen BMI-Werten und Speichern in einer separaten Datei
+    np.random.seed(42)
+    bmi_values = np.random.uniform(18.5, 35.0, len(df_kunden))
+    df_bmi = pd.DataFrame({"id": df_kunden["id"], "BMI": np.round(bmi_values, 1)})
+    df_bmi.to_csv("bmi.csv", index=False)
+
+def extract_and_merge_data(spark):
+    # Einlesen der vorbereiteten CSV-Dateien in Spark DataFrames und Zusammenführen über die ID
+    df1 = spark.read.csv("temp_kunden.csv", header=True, inferSchema=True)
+    df2 = spark.read.csv("bmi.csv", header=True, inferSchema=True)
+    return df1.join(df2, on="id", how="inner")
+
+# Die Funktion transform_data führt nur fehlende Werte-Entfernung aus,
+# Indexer und Assembler sind Bestandteil der Pipeline-Modelle
+def transform_data(df):
+    return df.dropna()
+
+def scale_features(df):
+    # Skalieren der Merkmale mit StandardScaler (Mittelwert = 0, Standardabweichung = 1)
+    scaler = StandardScaler(inputCol="features_unscaled", outputCol="features", withMean=True, withStd=True)
+    model = scaler.fit(df)
+    return model.transform(df)
+
+def prepare_train_test_split(df):
+    # Aufteilen der Daten in Trainings- und Testdatensätze (70% / 30%)
+    return df.randomSplit([0.7, 0.3], seed=42)
+
+# ==================== Modelle erstellen ====================
+def build_models():
+    models = []
+
+    # Indexer für die kategoriale Variable "Geschlecht"
+    indexer = StringIndexer(inputCol="Geschlecht", outputCol="Geschlecht_index")
+    # Vektorassembler zum Zusammenführen der Features
+    assembler = VectorAssembler(inputCols=["Alter", "Einkommen", "Geschlecht_index", "BMI"], outputCol="features_unscaled")
+    # StandardScaler zur Normierung der Features
+    scaler = StandardScaler(inputCol="features_unscaled", outputCol="features", withMean=True, withStd=True)
+
+    # Logistische Regression Pipeline und Parametergrid
+    lr = LogisticRegression(labelCol="gekauft", featuresCol="features")
+    pipeline_lr = Pipeline(stages=[indexer, assembler, scaler, lr])
+    grid_lr = ParamGridBuilder() \
+        .addGrid(lr.regParam, [0.0, 0.1, 0.01]) \
+        .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0]) \
+        .build()
+    models.append(("Logistische Regression", pipeline_lr, grid_lr))
+
+    # Entscheidungsbaum Pipeline und Parametergrid
+    dt = DecisionTreeClassifier(labelCol="gekauft", featuresCol="features")
+    pipeline_dt = Pipeline(stages=[indexer, assembler, scaler, dt])
+    grid_dt = ParamGridBuilder() \
+        .addGrid(dt.maxDepth, [3, 5, 10]) \
+        .build()
+    models.append(("Entscheidungsbaum", pipeline_dt, grid_dt))
+
+    # Random Forest Pipeline und Parametergrid
+    rf = RandomForestClassifier(labelCol="gekauft", featuresCol="features", seed=42)
+    pipeline_rf = Pipeline(stages=[indexer, assembler, scaler, rf])
+    grid_rf = ParamGridBuilder() \
+        .addGrid(rf.numTrees, [10, 50]) \
+        .addGrid(rf.maxDepth, [5, 10]) \
+        .build()
+    models.append(("Random Forest", pipeline_rf, grid_rf))
+
+    return models
+
+def evaluate_model(predictions):
+    # Bewertung der Modell-Performance anhand von Precision, Recall und F1-Score
+    evaluator = MulticlassClassificationEvaluator(labelCol="gekauft", predictionCol="prediction", metricName="f1")
+    return {
+        "precision": MulticlassClassificationEvaluator(labelCol="gekauft", predictionCol="prediction", metricName="precisionByLabel").evaluate(predictions),
+        "recall": MulticlassClassificationEvaluator(labelCol="gekauft", predictionCol="prediction", metricName="recallByLabel").evaluate(predictions),
+        "f1": evaluator.evaluate(predictions)
+    }
+
+# ==================== Visualisierung und Speicherung ====================
+def visualize_metrics(metrics_dict, path="model_metrics.png"):
+    # Visualisierung der Bewertungsmetriken für die Modelle als Balkendiagramm
+    names, values = list(metrics_dict.keys()), list(metrics_dict.values())
+    metrics = ['precision', 'recall', 'f1']
+    data = np.array([[m[k] for k in metrics] for m in values])
+
+    x = np.arange(len(names))
+    width = 0.25
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for i, met in enumerate(metrics):
+        ax.bar(x + i*width, data[:, i], width, label=met.capitalize())
+
+    ax.set_xticks(x + width)
+    ax.set_xticklabels(names, rotation=30, ha='right')
+    ax.set_ylim(0, 1)
+    ax.set_title("Modellvergleich anhand der Metriken")
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(path)
+    plt.show()
+
+def save_best_model(cv_model):
+    # Speichern des besten Modells, falls der Ordner bereits existiert, wird er gelöscht
+    try:
+        if os.path.exists(MODEL_DIR):
+            shutil.rmtree(MODEL_DIR)
+        cv_model.bestModel.write().overwrite().save(MODEL_DIR)
+        print("[✓] Bestes Modell (gesamte Pipeline) wurde gespeichert.")
+    except Exception as e:
+        print(f"[Fehler] Modell konnte nicht gespeichert werden: {e}")
+
+# ==================== Modell verwenden ====================
+def predict_new_data(spark):
+    try:
+        from pyspark.ml.pipeline import PipelineModel
+        model = PipelineModel.load(MODEL_DIR)
+        neue_daten = [
+            (45, 50000, 22.5, "männlich"),
+            (30, 35000, 24.1, "weiblich"),
+            (60, 75000, 27.3, "männlich"),
+            (22, 28000, 19.8, "weiblich"),
+            (38, 60000, 26.0, "männlich"),
+            (50, 52000, 23.7, "weiblich"),
+            (27, 40000, 21.4, "männlich"),
+            (33, 45000, 25.5, "weiblich"),
+            (41, 70000, 28.2, "männlich"),
+            (55, 65000, 24.9, "weiblich"),
+        ]
+        neue_df = spark.createDataFrame(neue_daten, ["Alter", "Einkommen", "BMI", "Geschlecht"])
+        # Neue Daten durch die gespeicherte Pipeline transformieren
+        predictions = model.transform(neue_df)
+        predictions.select("Alter", "Einkommen", "BMI", "Geschlecht", "prediction", "probability").show(truncate=False)
+    except Exception as e:
+        print(f"[Fehler bei der Vorhersage] {e}")
+
+# ==================== Main ====================
+def main():
+    spark = create_spark_session()
+
+    vorbereite_daten()
+    df = extract_and_merge_data(spark)
+    df = transform_data(df)  # Nur Entfernen von fehlenden Werten
+    train_df, test_df = prepare_train_test_split(df)
+
+    models = build_models()
+    metrics_dict = {}
+    best_score = -1
+    best_cv_model = None
+
+    for name, pipeline, param_grid in models:
+        print(f"🧪 Modell: {name}")
+        cv = CrossValidator(estimator=pipeline, estimatorParamMaps=param_grid,
+                            evaluator=BinaryClassificationEvaluator(labelCol="gekauft"),
+                            numFolds=3, seed=42)
+        cv_model = cv.fit(train_df)
+        predictions = cv_model.transform(test_df)
+        metrics = evaluate_model(predictions)
+        metrics_dict[name] = metrics
+
+        if metrics["f1"] > best_score:
+            best_score = metrics["f1"]
+            best_cv_model = cv_model
+
+        print(f"→ F1: {metrics['f1']:.4f}, Precision: {metrics['precision']:.4f}, Recall: {metrics['recall']:.4f}")
+
+    visualize_metrics(metrics_dict)
+    save_best_model(best_cv_model)
+
+    user_input = input("⚙️  Möchten Sie neue Daten mit dem besten Modell verarbeiten? (Y/N): ").strip().lower()
+    if user_input == "y":
+        predict_new_data(spark)
+    else:
+        print("Beenden ohne neue Daten zu verarbeiten.")
+
+    spark.stop()
+
+
+if __name__ == "__main__":
+    main()

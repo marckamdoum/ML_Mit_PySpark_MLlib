@@ -1,0 +1,34 @@
+import pandas as pd
+import numpy as np
+
+def vorbereite_daten(kunden_csv="kunden.csv", output_kunden_csv="temp_kunden.csv", bmi_csv="bmi.csv", seed=42):
+    # === 1. Originaldatei laden ===
+    df_kunden = pd.read_csv(kunden_csv)
+
+    # === 2. ID-Spalte hinzufügen (Auto-Inkrement ab 1) ===
+    df_kunden.insert(0, "id", range(1, len(df_kunden) + 1))
+
+    # === 3. Neue Datei mit ID speichern ===
+    df_kunden.to_csv(output_kunden_csv, index=False)
+    print(f"[✓] Datei gespeichert: {output_kunden_csv} (Zeilen: {len(df_kunden)})")
+
+    # === 4. Zufällige BMI-Werte generieren ===
+    np.random.seed(seed)  # Für Reproduzierbarkeit
+    bmi_values = np.random.uniform(18.5, 35.0, len(df_kunden))
+
+    # === 5. DataFrame mit ID und BMI erstellen ===
+    df_bmi = pd.DataFrame({
+        "id": df_kunden["id"],
+        "BMI": np.round(bmi_values, 1)
+    })
+
+    # === 6. BMI-Datei speichern ===
+    df_bmi.to_csv(bmi_csv, index=False)
+    print(f"[✓] Datei gespeichert: {bmi_csv} (Zeilen: {len(df_bmi)})")
+
+vorbereite_daten() # Beispielaufruf # тут какая-то пафосная фраза на немецком о том, что были подготовлены данные для симуляции рабочего процесса
+
+# дальнейшее использование в Spark
+# df_kunden = spark.read.csv("temp_kunden.csv", header=True, inferSchema=True) # Загружаем основной файл с id
+# df_bmi = spark.read.csv("bmi.csv", header=True, inferSchema=True) # Загружаем файл с BMI
+# df = df_kunden.join(df_bmi, on="id", how="inner") # Beispielaufruf

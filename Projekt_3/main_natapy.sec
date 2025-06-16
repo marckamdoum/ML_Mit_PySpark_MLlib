@@ -1,0 +1,239 @@
+import pandas as pd
+import numpy as np
+from pyspark.sql import SparkSession
+from pyspark.ml import Pipeline
+from pyspark.ml.feature import StringIndexer, VectorAssembler, StandardScaler
+from pyspark.ml.classification import LogisticRegression, DecisionTreeClassifier, RandomForestClassifier
+from pyspark.ml.evaluation import BinaryClassificationEvaluator, MulticlassClassificationEvaluator
+from pyspark.ml.tuning import CrossValidator, ParamGridBuilder
+import matplotlib.pyplot as plt
+
+
+def create_spark_session():
+    """Erstellt und gibt eine SparkSession zurück."""
+    spark = SparkSession.builder \
+        .appName("MLlib Kundenmodell") \
+        .getOrCreate()
+    return spark
+
+
+def vorbereite_daten(kunden_csv="kunden.csv", output_kunden_csv="temp_kunden.csv", bmi_csv="bmi.csv", seed=42):
+    # === 1. Originaldatei laden ===
+    df_kunden = pd.read_csv(kunden_csv)
+
+    # === 2. ID-Spalte hinzufügen (Auto-Inkrement ab 1) ===
+    df_kunden.insert(0, "id", range(1, len(df_kunden) + 1))
+
+    # === 3. Neue Datei mit ID speichern ===
+    df_kunden.to_csv(output_kunden_csv, index=False)
+    print(f"[✓] Datei gespeichert: {output_kunden_csv} (Zeilen: {len(df_kunden)})")
+
+    # === 4. Zufällige BMI-Werte generieren ===
+    np.random.seed(seed)  # Für Reproduzierbarkeit
+    bmi_values = np.random.uniform(18.5, 35.0, len(df_kunden))
+
+    # === 5. DataFrame mit ID und BMI erstellen ===
+    df_bmi = pd.DataFrame({
+        "id": df_kunden["id"],
+        "BMI": np.round(bmi_values, 1)
+    })
+
+    # === 6. BMI-Datei speichern ===
+    df_bmi.to_csv(bmi_csv, index=False)
+    print(f"[✓] Datei gespeichert: {bmi_csv} (Zeilen: {len(df_bmi)})")
+
+
+def extract_and_merge_data(spark, path_features: str, path_labels: str):
+    """
+    Liest zwei CSV-Dateien ein und merged sie anhand der Kunden-ID (Spalte: 'id').
+
+    :param spark: SparkSession
+    :param path_features: Pfad zur CSV-Datei mit Kundenfeatures (enthält 'id')
+    :param path_labels: Pfad zur CSV-Datei mit zusätzlichen Daten (BMI, enthält auch 'id')
+    :return: Spark DataFrame mit zusammengeführten Daten
+    """
+    # CSV-Dateien einlesen
+    df_features = spark.read.csv(path_features, header=True, inferSchema=True)
+    df_labels = spark.read.csv(path_labels, header=True, inferSchema=True)
+
+    # Merge durchführen
+    df_merged = df_features.join(df_labels, on="id", how="inner")
+
+    print(f"[✓] Daten erfolgreich zusammengeführt (Zeilen: {df_merged.count()})")
+
+    return df_merged
+
+
+def transform_data(df):
+    """
+    Führt Datenbereinigung und Transformation durch:
+    - Entfernt Zeilen mit Null-Werten
+    - Wandelt kategoriale Spalte 'Geschlecht' in numerisch um
+    - Erstellt den Feature-Vektor für ML (inkl. BMI)
+    """
+    df = df.dropna()
+
+    indexer = StringIndexer(inputCol="Geschlecht", outputCol="Geschlecht_index")
+    df = indexer.fit(df).transform(df)
+
+    input_features = ["Alter", "Einkommen", "Geschlecht_index", "BMI"]
+    assembler = VectorAssembler(inputCols=input_features, outputCol="features_unscaled")
+    df = assembler.transform(df)
+
+    print(f"[✓] Transformation abgeschlossen. Vorschau:")
+    df.select("features_unscaled", "gekauft").show(10, truncate=False)
+
+    return df
+
+
+def scale_features(df):
+    """Skaliert die Features."""
+    scaler = StandardScaler(
+        inputCol="features_unscaled",
+        outputCol="features",
+        withMean=True,
+        withStd=True
+    )
+    scaler_model = scaler.fit(df)
+    return scaler_model.transform(df)
+
+
+def prepare_train_test_split(df, test_ratio=0.3, seed=42):
+    """Teilt den DataFrame in Trainings- und Testdaten auf."""
+    df_train, df_test = df.randomSplit([1 - test_ratio, test_ratio], seed=seed)
+    return df_train, df_test
+
+
+def build_models():
+    models = []
+
+    lr = LogisticRegression(labelCol="gekauft", featuresCol="features")
+    lr_param_grid = ParamGridBuilder() \
+        .addGrid(lr.regParam, [0.0, 0.1, 0.01]) \
+        .addGrid(lr.elasticNetParam, [0.0, 0.5, 1.0]) \
+        .build()
+    models.append(("Logistic Regression", Pipeline(stages=[lr]), lr_param_grid))
+
+    dt_gini = DecisionTreeClassifier(labelCol="gekauft", featuresCol="features", impurity="gini")
+    dt_param_grid = ParamGridBuilder() \
+        .addGrid(dt_gini.maxDepth, [3, 5, 10]) \
+        .build()
+    models.append(("Decision Tree (Gini)", Pipeline(stages=[dt_gini]), dt_param_grid))
+
+    dt_entropy = DecisionTreeClassifier(labelCol="gekauft", featuresCol="features", impurity="entropy")
+    dt_entropy_grid = ParamGridBuilder() \
+        .addGrid(dt_entropy.maxDepth, [3, 5, 10]) \
+        .build()
+    models.append(("Decision Tree (Entropy)", Pipeline(stages=[dt_entropy]), dt_entropy_grid))
+
+    rf = RandomForestClassifier(labelCol="gekauft", featuresCol="features", seed=42)
+    rf_param_grid = ParamGridBuilder() \
+        .addGrid(rf.numTrees, [10, 50]) \
+        .addGrid(rf.maxDepth, [5, 10]) \
+        .build()
+    models.append(("Random Forest", Pipeline(stages=[rf]), rf_param_grid))
+
+    return models
+
+
+def evaluate_model(predictions, label_col="gekauft"):
+    evaluator_precision = MulticlassClassificationEvaluator(
+        labelCol=label_col, predictionCol="prediction", metricName="precisionByLabel"
+    )
+    evaluator_recall = MulticlassClassificationEvaluator(
+        labelCol=label_col, predictionCol="prediction", metricName="recallByLabel"
+    )
+    evaluator_f1 = MulticlassClassificationEvaluator(
+        labelCol=label_col, predictionCol="prediction", metricName="f1"
+    )
+
+    precision = evaluator_precision.evaluate(predictions)
+    recall = evaluator_recall.evaluate(predictions)
+    f1 = evaluator_f1.evaluate(predictions)
+
+    return {"precision": precision, "recall": recall, "f1": f1}
+
+
+def save_metrics(metrics_dict, filename="model_metrics.txt"):
+    with open(filename, "w") as f:
+        for model, metrics in metrics_dict.items():
+            f.write(f"{model}:\n")
+            for metric_name, value in metrics.items():
+                f.write(f"  {metric_name}: {value:.4f}\n")
+            f.write("\n")
+    print(f"[✓] Metriken in {filename} gespeichert.")
+
+
+def visualize_metrics(metrics_dict, save_path=None):
+    metrics_names = ['precision', 'recall', 'f1']
+    model_names = list(metrics_dict.keys())
+
+    values = np.array([[metrics_dict[m][metric] for metric in metrics_names] for m in model_names])
+
+    x = np.arange(len(model_names))
+    width = 0.25
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    for i, metric in enumerate(metrics_names):
+        ax.bar(x + i * width, values[:, i], width, label=metric.capitalize())
+
+    ax.set_xticks(x + width)
+    ax.set_xticklabels(model_names, rotation=30, ha='right')
+    ax.set_ylim(0, 1)
+    ax.set_ylabel('Score')
+    ax.set_title('Modellevaluation: Precision, Recall und F1-Score')
+    ax.legend()
+    ax.grid(axis='y', linestyle='--', alpha=0.7)
+    plt.tight_layout()
+
+    if save_path:
+        plt.savefig(save_path)
+        print(f"[✓] Grafik als {save_path} gespeichert.")
+
+    plt.show()
+
+
+def main():
+    spark = create_spark_session()
+
+    vorbereite_daten()
+
+    df_raw = extract_and_merge_data(spark, "temp_kunden.csv", "bmi.csv")
+    df_raw.show(10)
+
+    df_clean = transform_data(df_raw)
+
+    df_scaled = scale_features(df_clean)
+
+    df_train, df_test = prepare_train_test_split(df_scaled)
+
+    models = build_models()
+
+    metrics_results = {}
+
+    for model_name, pipeline, param_grid in models:
+        print(f"\nEvaluating model: {model_name}")
+
+        crossval = CrossValidator(
+            estimator=pipeline,
+            estimatorParamMaps=param_grid,
+            evaluator=BinaryClassificationEvaluator(labelCol="gekauft"),
+            numFolds=3,
+            seed=42
+        )
+
+        cv_model = crossval.fit(df_train)
+        predictions = cv_model.transform(df_test)
+
+        metrics = evaluate_model(predictions)
+        metrics_results[model_name] = metrics
+
+        print(
+            f"{model_name} → Precision: {metrics['precision']:.3f}, Recall: {metrics['recall']:.3f}, F1: {metrics['f1']:.3f}")
+
+    save_metrics(metrics_results, "model_metrics.txt")
+    visualize_metrics(metrics_results, "model_metrics.png")
+
+
+main()
